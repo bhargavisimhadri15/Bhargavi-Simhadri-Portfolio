@@ -8,7 +8,7 @@ function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/portfolio')
+    fetch('/portfolio.json')
       .then(res => res.json())
       .then(data => {
         setData(data);
