@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 
-const AddProject = ({ onProjectAdded }) => {
+const AddProject = ({ onProjectAdded, ownerToken }) => {
   const [project, setProject] = useState({
     title: '',
     description: '',
@@ -13,17 +13,38 @@ const AddProject = ({ onProjectAdded }) => {
     e.preventDefault();
     setStatus('Adding Project...');
     
-    // In a real MERN app, this would be a POST request to /api/projects
-    // For this demonstration, we'll simulate the state update
     const newProject = {
       ...project,
       tech: project.tech.split(',').map(t => t.trim())
     };
 
-    // Simulate success
-    setStatus('Project added successfully! (Simulated)');
-    onProjectAdded(newProject);
-    setProject({ title: '', description: '', tech: '', link: '#' });
+    try {
+      const res = await fetch('/api/projects', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(ownerToken ? { 'x-admin-token': ownerToken } : {}),
+        },
+        body: JSON.stringify(newProject),
+      });
+
+      if (!res.ok) {
+        const contentType = String(res.headers.get('content-type') || '');
+        if (contentType.includes('application/json')) {
+          const msg = await res.json().catch(() => null);
+          setStatus(msg?.message ? `Failed to add project: ${msg.message}` : 'Failed to add project.');
+          return;
+        }
+        throw new Error(`Non-JSON response (${res.status})`);
+      }
+
+      const created = await res.json();
+      setStatus('Project added successfully!');
+      onProjectAdded(created);
+      setProject({ title: '', description: '', tech: '', link: '#' });
+    } catch (err) {
+      setStatus('Failed to add project (server not reachable).');
+    }
   };
 
   return (

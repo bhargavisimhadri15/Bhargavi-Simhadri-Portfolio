@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import nodemailer from 'nodemailer';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -25,15 +26,42 @@ if (!process.env.MONGODB_URI) {
   console.warn('MONGODB_URI is not set. Falling back to local MongoDB:', MONGODB_URI);
 }
 
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+let mongoConnectPromise = null;
+
+const connectMongo = () => {
+  if (mongoConnectPromise) return mongoConnectPromise;
+
+  mongoConnectPromise = mongoose
+    .connect(MONGODB_URI)
+    .then(() => {
+      console.log('Connected to MongoDB');
+      return true;
+    })
+    .catch((err) => {
+      console.error('MongoDB connection error:', err);
+      mongoConnectPromise = null;
+      throw err;
+    });
+
+  return mongoConnectPromise;
+};
+
+connectMongo().catch(() => {});
 
 mongoose.connection.on('disconnected', () => {
   console.warn('MongoDB disconnected');
 });
 
 const isMongoConnected = () => mongoose.connection.readyState === 1;
+const ensureMongoConnected = async () => {
+  if (isMongoConnected()) return true;
+  try {
+    await connectMongo();
+  } catch {
+    return false;
+  }
+  return isMongoConnected();
+};
 
 const contactMessageSchema = new mongoose.Schema(
   {
@@ -46,6 +74,20 @@ const contactMessageSchema = new mongoose.Schema(
 
 const ContactMessage =
   mongoose.models.ContactMessage || mongoose.model('ContactMessage', contactMessageSchema);
+
+const projectSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true, trim: true },
+    description: { type: String, required: true, trim: true },
+    tech: { type: [String], default: [] },
+    link: { type: String, default: '#', trim: true },
+    order: { type: Number, default: 0 },
+    featured: { type: Boolean, default: true },
+  },
+  { timestamps: true, bufferCommands: false }
+);
+
+const Project = mongoose.models.Project || mongoose.model('Project', projectSchema);
 
 const mailTo = process.env.MAIL_TO || 'bhargavisimhadri1998@gmail.com';
 const mailFrom = process.env.MAIL_FROM || process.env.SMTP_USER || '';
@@ -78,9 +120,62 @@ app.get('/api/health', (req, res) => {
     ok: true,
     mongoConnected: isMongoConnected(),
     emailConfigured: isEmailConfigured(),
+    adminEnabled: Boolean(String(process.env.ADMIN_TOKEN || '').trim()),
     port: PORT,
   });
 });
+
+const adminToken = String(process.env.ADMIN_TOKEN || '').trim();
+if (!adminToken) {
+  console.warn('ADMIN_TOKEN is not set. Project write APIs are disabled.');
+}
+
+function isValidAdminToken(provided) {
+  if (!adminToken) return false;
+  if (!provided) return false;
+
+  try {
+    const a = Buffer.from(String(adminToken), 'utf8');
+    const b = Buffer.from(String(provided), 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (!adminToken) {
+    return res.status(503).json({ message: 'Admin is not configured on the server.' });
+  }
+
+  const headerToken = String(req.header('x-admin-token') || '').trim();
+  const authHeader = String(req.header('authorization') || '').trim();
+  const bearerToken =
+    authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+
+  const token = headerToken || bearerToken;
+
+  if (isValidAdminToken(token)) return next();
+  return res.status(401).json({ message: 'Unauthorized' });
+}
+
+app.get('/api/admin/check', requireAdmin, (req, res) => {
+  res.json({ ok: true });
+});
+
+function normalizeTech(value) {
+  if (Array.isArray(value)) {
+    return value.map(v => String(v).trim()).filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map(v => v.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
 
 // Data from Resume
 const portfolioData = {
@@ -198,8 +293,183 @@ const portfolioData = {
 };
 
 // Routes
-app.get('/api/portfolio', (req, res) => {
-  res.json(portfolioData);
+app.get('/api/portfolio', async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.json(portfolioData);
+  }
+
+  try {
+    const dbProjects = await Project.find({})
+      .sort({ featured: -1, order: -1, createdAt: -1 })
+      .lean();
+
+    if (!dbProjects.length) {
+      return res.json(portfolioData);
+    }
+
+    const projects = dbProjects.map(p => ({
+      _id: p._id,
+      title: p.title,
+      description: p.description,
+      tech: Array.isArray(p.tech) ? p.tech : [],
+      link: p.link || '#',
+    }));
+
+    return res.json({ ...portfolioData, projects });
+  } catch (err) {
+    console.error('Failed to load projects from MongoDB:', err);
+    return res.json(portfolioData);
+  }
+});
+
+app.get('/api/projects', async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.status(503).json({ message: 'MongoDB is not connected.' });
+  }
+
+  try {
+    const projects = await Project.find({})
+      .sort({ featured: -1, order: -1, createdAt: -1 })
+      .lean();
+    return res.json(projects);
+  } catch (err) {
+    console.error('Failed to list projects:', err);
+    return res.status(500).json({ message: 'Failed to list projects.' });
+  }
+});
+
+app.get('/api/projects/:id', async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.status(503).json({ message: 'MongoDB is not connected.' });
+  }
+
+  try {
+    const project = await Project.findById(req.params.id).lean();
+    if (!project) return res.status(404).json({ message: 'Project not found.' });
+    return res.json(project);
+  } catch (err) {
+    console.error('Failed to fetch project:', err);
+    return res.status(400).json({ message: 'Invalid project id.' });
+  }
+});
+
+app.post('/api/projects', requireAdmin, async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.status(503).json({ message: 'MongoDB is not connected.' });
+  }
+
+  const title = String(req.body?.title || '').trim();
+  const description = String(req.body?.description || '').trim();
+  const link = String(req.body?.link || '#').trim() || '#';
+  const tech = normalizeTech(req.body?.tech);
+  const featured = typeof req.body?.featured === 'boolean' ? req.body.featured : true;
+  const order = Number.isFinite(Number(req.body?.order)) ? Number(req.body.order) : 0;
+
+  if (!title || !description) {
+    return res.status(400).json({ message: 'title and description are required.' });
+  }
+
+  try {
+    const created = await Project.create({ title, description, tech, link, featured, order });
+    return res.status(201).json(created);
+  } catch (err) {
+    console.error('Failed to create project:', err);
+    return res.status(500).json({ message: 'Failed to create project.' });
+  }
+});
+
+app.post('/api/projects/seed', requireAdmin, async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.status(503).json({ message: 'MongoDB is not connected.' });
+  }
+
+  try {
+    const existingCount = await Project.estimatedDocumentCount();
+    if (existingCount > 0) {
+      return res.status(409).json({
+        message: 'Projects already exist in the database. Seed skipped.',
+        existingCount,
+      });
+    }
+
+    const seedProjects = Array.isArray(portfolioData?.projects) ? portfolioData.projects : [];
+    if (!seedProjects.length) {
+      return res.status(400).json({ message: 'No seed projects found.' });
+    }
+
+    const docs = seedProjects.map((p, idx) => ({
+      title: String(p?.title || '').trim(),
+      description: String(p?.description || '').trim(),
+      tech: normalizeTech(p?.tech),
+      link: String(p?.link || '#').trim() || '#',
+      featured: true,
+      order: seedProjects.length - idx,
+    })).filter(p => p.title && p.description);
+
+    if (!docs.length) {
+      return res.status(400).json({ message: 'Seed projects are invalid.' });
+    }
+
+    const inserted = await Project.insertMany(docs);
+    return res.status(201).json({ insertedCount: inserted.length });
+  } catch (err) {
+    console.error('Failed to seed projects:', err);
+    return res.status(500).json({ message: 'Failed to seed projects.' });
+  }
+});
+
+app.put('/api/projects/:id', requireAdmin, async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.status(503).json({ message: 'MongoDB is not connected.' });
+  }
+
+  const updates = {};
+
+  if (req.body?.title !== undefined) updates.title = String(req.body.title || '').trim();
+  if (req.body?.description !== undefined) {
+    updates.description = String(req.body.description || '').trim();
+  }
+  if (req.body?.link !== undefined) updates.link = String(req.body.link || '#').trim() || '#';
+  if (req.body?.tech !== undefined) updates.tech = normalizeTech(req.body.tech);
+  if (req.body?.featured !== undefined) updates.featured = Boolean(req.body.featured);
+  if (req.body?.order !== undefined && Number.isFinite(Number(req.body.order))) {
+    updates.order = Number(req.body.order);
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ message: 'No valid fields provided.' });
+  }
+
+  if (updates.title === '' || updates.description === '') {
+    return res.status(400).json({ message: 'title/description cannot be empty.' });
+  }
+
+  try {
+    const updated = await Project.findByIdAndUpdate(req.params.id, updates, {
+      new: true,
+      runValidators: true,
+    });
+    if (!updated) return res.status(404).json({ message: 'Project not found.' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('Failed to update project:', err);
+    return res.status(400).json({ message: 'Invalid project id.' });
+  }
+});
+
+app.delete('/api/projects/:id', requireAdmin, async (req, res) => {
+  if (!(await ensureMongoConnected())) {
+    return res.status(503).json({ message: 'MongoDB is not connected.' });
+  }
+
+  try {
+    const deleted = await Project.findByIdAndDelete(req.params.id);
+    if (!deleted) return res.status(404).json({ message: 'Project not found.' });
+    return res.status(204).end();
+  } catch (err) {
+    console.error('Failed to delete project:', err);
+    return res.status(400).json({ message: 'Invalid project id.' });
+  }
 });
 
 app.post('/api/contact', async (req, res) => {
@@ -215,7 +485,7 @@ app.post('/api/contact', async (req, res) => {
 
   let saved = false;
   try {
-    if (!isMongoConnected()) {
+    if (!(await ensureMongoConnected())) {
       throw new Error('MongoDB is not connected. Check MONGODB_URI and Atlas Network Access.');
     }
     await ContactMessage.create({ name, email, message });
@@ -282,21 +552,25 @@ app.post('/api/contact', async (req, res) => {
   }
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+if (!process.env.VERCEL) {
+  const server = app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 
-server.on('error', (err) => {
-  if (err?.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use.`);
-    console.error('Stop the other process, or start with a different port.');
-    console.error('PowerShell example: $env:PORT=5001; npm run dev');
+  server.on('error', (err) => {
+    if (err?.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use.`);
+      console.error('Stop the other process, or start with a different port.');
+      console.error('PowerShell example: $env:PORT=5001; npm run dev');
+      process.exit(1);
+    }
+
+    console.error('Server error:', err);
     process.exit(1);
-  }
+  });
+}
 
-  console.error('Server error:', err);
-  process.exit(1);
-});
+export default app;
 
 function escapeHtml(value) {
   return String(value)
